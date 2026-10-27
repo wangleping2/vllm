@@ -76,6 +76,16 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 n = min(arrived, room)
                 if n < 1:
                     break
+                # Batch up partial-arrival windows: a window that does
+                # not fill the remaining budget while the request's data
+                # is still incoming is deferred so it merges with the
+                # next chunk - a few-row remnant would otherwise occupy a
+                # whole step for its fixed overhead. The tail (data fully
+                # arrived) is exempt so the request always finishes, and
+                # a preempted-recompute request holds the full recv_rows
+                # so it never hits this either.
+                if n < room and computed + arrived < request.num_prompt_tokens:
+                    continue
                 windowed.append((request, n, computed))
                 room -= n
         if windowed:
