@@ -17,6 +17,7 @@ the engine's native batch-queue path. See lwd_chunked_prefill_design.md
 
 from __future__ import annotations
 
+import os
 import time
 from collections import deque
 from collections.abc import Callable
@@ -71,14 +72,20 @@ _LWD_FINISH_STATUS = {
     FinishReason.ERROR: RequestStatus.FINISHED_ABORTED,
 }
 
-# Cloud-side pending cap, counted in unconsumed chunks (seqno): one seqno =
-# one cloud-step consumption unit. The edge records seqno -> in-batch request
-# list; once every request in a batch has received its first token, that
-# chunk is consumed; when the number of unconsumed chunks reaches the cap,
-# new prefill admission stops -- requests accumulate in the edge waiting
-# queue (picker FCFS prefix naturally forms multi-request batches), and the
-# gate reopens by itself once the cloud-side pending drains.
-_LWD_MAX_PENDING_CHUNKS = 3
+# Edge lead cap, counted in sent-but-not-yet-received chunks (seqno):
+# one seqno = one cloud receive. Removal is driven by the UP send
+# completion watermark the edge runner rides on every result
+# (lwd_edge_note_send_watermark; semantics = the cloud's recv landed,
+# decoupled from the cloud COMPUTING them); the per-request drop stays
+# only as the abort/finish backstop. When pending reaches the cap, new
+# prefill admission stops -- requests accumulate in the edge waiting
+# queue (picker FCFS prefix naturally forms multi-request batches) -- and
+# the gate reopens as the cloud receives. Env-tunable; the value must
+# stay <= the cloud's VLLM_ASCEND_LWD_MAX_INFLIGHT_RECV (default 8) so
+# the cloud can always post what the edge has in flight.
+_LWD_MAX_PENDING_CHUNKS = int(
+    os.environ.get("VLLM_ASCEND_LWD_MAX_PENDING_CHUNKS", "6")
+)
 
 
 class LwdEdgeScheduler(LwdBaseScheduler):
@@ -245,6 +252,13 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         without lwd_batch (the underlying layer returns None on normal
         completion, replaced by the engine proxy with a placeholder) are a
         no-op."""
+        # UP send completion watermark rides every edge result (embed and
+        # unembed alike): release the pending-gate entries the cloud has
+        # received. Read before anything else - the gate decides the NEXT
+        # schedule step.
+        wm = getattr(model_runner_output, "lwd_up_send_watermark", -1)
+        if wm is not None and wm >= 0:
+            self.lwd_edge_note_send_watermark(wm)
         batch = getattr(scheduler_output, "lwd_batch", None)
         outputs: list[EngineCoreOutput] = []
         finished: set[str] = set()
@@ -541,6 +555,10 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         )
         self.lwd_send_to_cloud(LwdRangeNotify(seqno=seqno, items=items))
         self._lwd_seqno = seqno + 1
+        # Batch-granular pending entry: removed when the cloud RECEIVES
+        # this seqno (send-completion watermark, see
+        # lwd_edge_note_send_watermark); the request-level drop is the
+        # abort/finish backstop only.
         self._lwd_pending_batches[seqno] = set(req_ids)
         # On successful send, assemble the EMBED batch and attach it to SO:
         # seqno is the pairing key of the data-plane tensor sent to the
@@ -640,12 +658,27 @@ class LwdEdgeScheduler(LwdBaseScheduler):
         self._lwd_drop_pending_request(request_id)
         return True
 
+    def lwd_edge_note_send_watermark(self, watermark: int) -> None:
+        """UP send completion watermark (the edge runner rides it on every
+        result): every seqno <= watermark has been RECEIVED by the cloud
+        (isend completion = data landed in the peer's posted recv buffer),
+        so those entries leave the edge-lead ledger.
+
+        Release semantics = cloud received, NOT cloud computed: the edge
+        lead pace decouples from cloud compute completion, which is what
+        makes a larger cap than the old first-token gate safe."""
+        cleared = [
+            seqno for seqno in self._lwd_pending_batches if seqno <= watermark
+        ]
+        for seqno in cleared:
+            del self._lwd_pending_batches[seqno]
+
     def _lwd_drop_pending_request(self, request_id: str) -> None:
-        """Remove a request from the pending ledger (shared by first-token
-        arrival/termination/abort): discard the request from each batch;
-        once a batch is fully drained -> the whole entry is removed (the
-        pending watermark drops; failing to remove would make it only ever
-        rise, leaving the prefill gate in permanent HOLD)."""
+        """Backstop removal of one request from the pending ledger
+        (termination/abort; the primary removal is the send-completion
+        watermark): discard the request from each batch; once a batch is
+        fully drained -> the whole entry is removed (a stale entry would
+        keep the gate held forever after an abort)."""
         for seqno in list(self._lwd_pending_batches):
             batch = self._lwd_pending_batches[seqno]
             batch.discard(request_id)
