@@ -984,6 +984,63 @@ class WorkerProc:
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
         """
+        # LWD: step-meta harvest (this is the enqueue point of the output
+        # thread / sync path - off the compute critical path). The ready
+        # event rides the output object per step (a shared worker
+        # attribute has an "assigned but not recorded yet" window; syncing
+        # an unrecorded event would pass immediately). Events do not
+        # pickle: removed before the response leaves the process. The
+        # cross-stream dependency must be device-side - host-side event
+        # sync cannot order a copy on another stream on this platform -
+        # so the copy stream waits on the ready event and the completion
+        # event is recorded on the copy stream (same shape as the native
+        # async output copies). The carrier is rewritten from the
+        # unharvested 5-tuple to the finished 4-tuple (cpu tensor,
+        # req_ids, numel, seqno); the [meta|seg_lens] wire layout is
+        # unchanged, the engine's parse path needs no changes.
+        inner = getattr(output, "_model_runner_output", output)
+        ready_event = getattr(inner, "lwd_meta_ready_event", None)
+        if ready_event is not None:
+            delattr(inner, "lwd_meta_ready_event")
+        carrier = getattr(inner, "lwd_down_carrier", None)
+        if carrier is not None and len(carrier) == 5:
+            # The carrier and the ready event are attached as a pair by
+            # the cloud worker; one without the other means the wiring
+            # broke - fail fast instead of reading unfenced device memory.
+            assert ready_event is not None, "lwd carrier without ready event"
+            (meta_dev, seg_lens_host, req_ids, hidden_numel, seqno) = carrier
+            stream = getattr(self, "_lwd_harvest_stream", None)
+            if stream is None:
+                stream = self._lwd_harvest_stream = torch.npu.Stream()
+            n_dev = meta_dev.numel()
+            n_seg = len(seg_lens_host) if seg_lens_host is not None else 0
+            n_meta = n_dev + n_seg
+            buf = getattr(self, "_lwd_harvest_pinned", None)
+            if buf is None or buf.numel() < n_meta:
+                buf = torch.empty(
+                    max(n_meta, 4096), dtype=torch.int32, pin_memory=True
+                )
+                self._lwd_harvest_pinned = buf
+            _t_sync = time.monotonic()
+            with torch.npu.stream(stream):
+                stream.wait_event(ready_event)
+                buf[:n_dev].copy_(meta_dev, non_blocking=True)
+                done = torch.npu.Event()
+                done.record()
+            done.synchronize()
+            if n_seg:
+                buf.numpy()[n_dev : n_dev + n_seg] = seg_lens_host
+            inner.lwd_down_carrier = (buf[:n_meta], req_ids, hidden_numel, seqno)
+            # Harvest timing (includes waiting for the main-stream compute
+            # to drain): ~0 = the device was already idle, large = the
+            # response leg was held.
+            logger.info(
+                "[Lwd][perf] meta-harvest seqno=%d dur=%.2fms ts=%.3f",
+                seqno,
+                (time.monotonic() - _t_sync) * 1000,
+                time.monotonic(),
+            )
+
         if isinstance(output, AsyncModelRunnerOutput):
             try:
                 output = output.get_output()
