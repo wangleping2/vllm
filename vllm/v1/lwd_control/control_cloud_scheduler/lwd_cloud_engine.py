@@ -236,22 +236,51 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
             )
 
             num_tokens = sum(item.num_tokens for item in items)
-            hint_req_rows = [
-                (it.request_id, it.offset + it.num_tokens) for it in items
-            ]
             aux_rows = 0
-            # Log before enqueueing: the worker comm thread can pick
-            # the hint up within 0.5 ms; if the log came after the
-            # enqueue, cross-process log write ordering would make
-            # hint2sub go negative, which looks like a timing anomaly.
-            lwd_logger.info(
-                "[Lwd][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
-                msg.seqno,
-                num_tokens,
-                time.monotonic(),
-            )
-            post_irecv_hint(make_recv_hint(
-                msg.seqno, num_tokens, aux_rows, req_rows=hint_req_rows))
+            # Host-staging row table (two coordinate systems, never merged):
+            #   rows           = this chunk's row count per request (the
+            #                    batch layout derives from it by accumulation);
+            #   prompt_offsets = the chunk's start within its OWN prompt
+            #                    (the stager's row_base);
+            #   prompt_lens    = full prompt rows per request (host buffer
+            #                    sizing authority, one-shot allocation).
+            req_ids = [it.request_id for it in items]
+            rows = [it.num_tokens for it in items]
+            prompt_offsets = [it.offset for it in items]
+            prompt_lens = [
+                self._lwd_prompt_len.get(rid, 0) for rid in req_ids
+            ]
+            missing = [
+                rid for rid, plen in zip(req_ids, prompt_lens) if plen <= 0
+            ]
+            if missing:
+                # The edge admits a request (RequestNotify) before
+                # scheduling it (RangeNotify), so the local ledger must
+                # already hold every length; a miss is a protocol
+                # violation. Skipping the hint leaves the arrival ledger
+                # at 0 - loud (the request never schedules) and safe,
+                # unlike staging with a wrong-length buffer.
+                lwd_logger.error(
+                    "[LWD][pre-recv] HINT seqno=%d skipped: missing "
+                    "prompt_lens for %s (RangeNotify before metadata)",
+                    msg.seqno,
+                    missing,
+                )
+            else:
+                # Log before enqueueing: the worker comm thread can pick
+                # the hint up within 0.5 ms; if the log came after the
+                # enqueue, cross-process log write ordering would make
+                # hint2sub go negative, which looks like a timing anomaly.
+                lwd_logger.info(
+                    "[LWD][pre-recv] HINT seqno=%d num_tokens=%d ts=%.3f",
+                    msg.seqno,
+                    num_tokens,
+                    time.monotonic(),
+                )
+                post_irecv_hint(make_recv_hint(
+                    msg.seqno, num_tokens, aux_rows,
+                    req_ids=req_ids, rows=rows,
+                    prompt_offsets=prompt_offsets, prompt_lens=prompt_lens))
         elif isinstance(msg, LwdRequestNotify):
             request = self._lwd_build_request(msg)
             # Message v2: full-prompt mrope arrives once at admission - stash
@@ -342,9 +371,10 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         return out
 
     def _lwd_drain_irecv_completions(self) -> None:
-        """Drain the done MQ every step, merging the UP recvs the
-        worker finished into the early-recv watermark (the gate
-        readiness predicate)."""
+        """Drain the done MQ every step: merge the UP recvs the worker
+        finished into the channel watermark AND the per-request arrival
+        ledger (``_lwd_recv_rows``) - the latter is what the visible-set
+        scheduler reads to size each request's window."""
         done_mq = getattr(self, "_lwd_done_mq", None)
         if done_mq is None:
             return
@@ -366,25 +396,41 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
                 break
         if not items:
             return
-        advanced = record_irecv_completions(items)
-        # Per-request arrival ledger (A2 piggybacks absolute rows on the done
-        # messages): idempotent max(), full-arrival releases the held request
-        # into the native input_queue. Absent piggyback = no-op (old peers).
+        # Two done-report shapes share this MQ:
+        #   * (channel, seqno)              - bare watermark key
+        #   * ((channel, seqno), arrived)   - key + per-request cumulative
+        #     arrived rows [(req_id, rows), ...] (host-staging publish)
+        # Normalize to keys for the watermark merge; the piggybacked rows
+        # feed the arrival ledger. Never unpack by arity in a log line
+        # (the old `{s for _ch, s in items}` crashed on the piggybacked
+        # form).
+        watermark_items = []
         per_req = []
-        for it in items:
-            # Done reports are (channel, seqno, req_rows) 3-tuples from the
-            # worker piggyback (A2); bare 2-tuples from old peers carry none.
-            rows = it[2] if isinstance(it, tuple) and len(it) > 2 else ()
-            per_req.extend(rows or ())
+        for item in items:
+            if (
+                isinstance(item, tuple)
+                and len(item) == 2
+                and isinstance(item[0], tuple)
+            ):
+                key, arrived = item
+                watermark_items.append(key)
+                per_req.extend(arrived or ())
+            else:
+                watermark_items.append(item)
+        advanced = record_irecv_completions(watermark_items)
+        # Per-request arrival ledger: max() merge over CUMULATIVE row
+        # counts (idempotent, replay-proof, never pushes past the real
+        # received high-water). This is the sole input the visible-set
+        # scheduler uses to size each request's next window.
         for req_id, arrived in per_req:
             self._lwd_recv_rows[req_id] = max(
                 self._lwd_recv_rows.get(req_id, 0), arrived)
-        # (hold-gate release removed: the scheduler's visible-set handles it)
         lwd_logger.info(
-            "[Lwd][pre-recv] DRAIN n=%d seqnos=%s advanced=%s ts=%.3f",
+            "[LWD][pre-recv] DRAIN n=%d seqnos=%s advanced=%s rows=%s ts=%.3f",
             len(items),
-            sorted({s for _ch, s in items}),
+            sorted({item[1] for item in watermark_items}),
             sorted({s for _ch, s in advanced}) if advanced else "[]",
+            per_req,
             time.monotonic(),
         )
 
