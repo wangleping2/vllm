@@ -9,6 +9,7 @@ from __future__ import annotations
 import itertools
 import time
 from collections import deque
+from dataclasses import dataclass
 
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.lwd_control.lwd_comm.lwd_messages import LwdC2eNotify, LWD_NOT_FINISHED
@@ -17,6 +18,7 @@ from vllm.v1.lwd_control.control_scheduler.lwd_base_scheduler import (
     LwdBaseScheduler,
 )
 
+@dataclass
 class LwdC2eMeta:
     """Step metadata unpacked from the cloud worker's DOWN carrier; the
     scheduler forwards it to the edge ahead of the DOWN hidden tensor
@@ -44,8 +46,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._lwd_dropped: set[str] = set()
-        self._lwd_abort_pending: list[str] = []
         # C2E output queue: update_from_output enqueues, the engine's
         # post_step flushes to the edge in one shot.
         self.pending_c2e: list[LwdC2eNotify] = []
@@ -67,8 +67,6 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 self.running, self.waiting, self.skipped_waiting
             ):
                 rid = request.request_id
-                if rid in self._lwd_dropped:
-                    continue
                 computed = request.num_computed_tokens
                 if computed >= request.num_prompt_tokens:
                     continue
