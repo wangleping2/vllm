@@ -118,6 +118,11 @@ class NewRequestData:
     lora_request: LoRARequest | None
     prompt_embeds: "torch.Tensor | None" = None
     prompt_is_token_ids: list[bool] | None = None
+    # LWD full-prompt mrope positions ([3, prompt_len] int64 raw bytes,
+    # wire v3): relayed from the Request (the RequestNotify payload) so
+    # the runner primes req_state once at the request's first scheduled
+    # step. Empty for text-only and non-LWD requests.
+    lwd_mrope_positions: bytes = b""
 
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None

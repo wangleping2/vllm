@@ -601,24 +601,18 @@ class LwdEdgeScheduler(LwdBaseScheduler):
             # optimistically; the start offset must step back by this
             # step's amount
             offset = request.num_computed_tokens - num_tokens
-            positions = self._lwd_mrope_positions_dict.get(request_id)
-            req_has_mrope = positions is not None
-            mrope_bytes = b""
-            if req_has_mrope:
-                assert positions is not None
-                mrope_bytes = (
-                    positions[:, offset : offset + num_tokens]
-                    .contiguous()
-                    .numpy()
-                    .tobytes()
-                )
+            # Wire v3: full-prompt positions ride the RequestNotify once
+            # (primed on the cloud at admission); the per-chunk byte
+            # slicing is retired. has_mrope stays as the per-request
+            # multimodal marker (diagnostics/logs); the bytes stay empty.
+            req_has_mrope = request_id in self._lwd_mrope_positions_dict
             items.append(
                 LwdRangeItem(
                     request_id=request_id,
                     offset=offset,
                     num_tokens=num_tokens,
                     has_mrope=req_has_mrope,
-                    mrope_positions=mrope_bytes,
+                    mrope_positions=b"",
                 )
             )
             req_ids.append(request_id)

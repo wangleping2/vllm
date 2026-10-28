@@ -194,6 +194,15 @@ class LwdCloudScheduler(LwdBaseScheduler):
                 native_prefill,
                 total_windows,
             )
+        # Full-prompt mrope positions ride the new requests' data to the
+        # runner (wire v3): stashed on the Request at admission, copied
+        # here so the runner primes req_state at its first step.
+        for d in out.scheduled_new_reqs:
+            req = self.requests.get(d.req_id)
+            if req is not None:
+                d.lwd_mrope_positions = (
+                    getattr(req, "lwd_mrope_positions", b"") or b""
+                )
         return out
 
     def update_from_output(self, scheduler_output, model_runner_output):
