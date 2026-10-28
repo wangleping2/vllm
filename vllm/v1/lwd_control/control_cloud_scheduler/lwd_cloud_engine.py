@@ -97,7 +97,37 @@ class LwdCloudEngineCore(LwdBaseEngineCore):
         # the drain (this thread) writes, the scheduler's visible-set
         # predicate reads on every step.
         self.scheduler.lwd_recv_rows = self._lwd_recv_rows
+        self._lwd_check_host_stage_switch()
         lwd_logger.info("[pre-recv] hint MQ created, done MQ attached via RPC")
+
+    def _lwd_check_host_stage_switch(self) -> None:
+        """Fail fast when the cloud would deadlock on a disabled stager.
+
+        Visible-set scheduling reads the per-request arrival rows that
+        ONLY the host-staging path publishes (the endpoint worker's
+        stager + done-MQ piggyback). With staging disabled, recv_rows
+        stays 0, the predicate rejects every prefill and the whole
+        system stops WITHOUT any error anywhere - so the misconfiguration
+        must surface at startup. The engine reads its own process
+        environment (same launch script exports as the workers').
+        """
+        try:
+            from vllm_ascend import envs
+        except ImportError:
+            lwd_logger.warning(
+                "[Lwd][host-stage] vllm_ascend.envs unavailable; "
+                "host-stage switch self-check skipped"
+            )
+            return
+        if envs.VLLM_ASCEND_LWD_HOST_STAGE:
+            return
+        raise RuntimeError(
+            "[Lwd][host-stage] VLLM_ASCEND_LWD_HOST_STAGE=0 disables the "
+            "arrival-row reporting the visible-set scheduler depends on: "
+            "recv_rows stays 0, every prefill is rejected and the system "
+            "deadlocks silently. Export VLLM_ASCEND_LWD_HOST_STAGE=1 "
+            "(the default) on the cloud side and restart."
+        )
 
     def _lwd_assemble(self) -> None:
         self._lwd_ingest_thread: threading.Thread | None = None
