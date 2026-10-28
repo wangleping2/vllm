@@ -146,12 +146,54 @@ class LwdCloudScheduler(LwdBaseScheduler):
         for request, n, _s in windowed:
             request.lwd_window_cap = n
         self.max_num_scheduled_tokens = decode_exact + total_windows
+        out = None
         try:
             out = self._lwd_schedule(req_ids)
         finally:
             self.max_num_scheduled_tokens = saved_budget
             for request, _n, _s in windowed:
                 request.lwd_window_cap = None
+        assert out is not None
+        # ---- W2 (design v7 §7): the watchdog over the one silent-
+        # miscalculation risk of this design. num_computed still holds
+        # the step-start values here (update_from_output has not run);
+        # `start` was captured before the native optimistic advance.
+        ledger = getattr(self, "lwd_recv_rows", None) or {}
+        for request, w, start in windowed:
+            rid = request.request_id
+            got = int(out.num_scheduled_tokens.get(rid, 0))
+            if got == 0:
+                continue
+            recv_rows = int(ledger.get(rid, 0))
+            if recv_rows <= 0:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid}: scheduled "
+                    f"{got} tokens but the data plane reported recv_rows=0 "
+                    f"(the request must not have entered the batch - the "
+                    f"visible-set predicate failed)"
+                )
+            if got > w or start + got > recv_rows:
+                raise RuntimeError(
+                    f"[Lwd][cloud-sched] W2 VIOLATION req={rid}: native "
+                    f"scheduled rows [{start}, {start + got}) - window={w}, "
+                    f"recv_rows={recv_rows} (lwd_window_cap failed)"
+                )
+        native_prefill = sum(
+            int(out.num_scheduled_tokens.get(r.request_id, 0))
+            for r, _n, _s in windowed
+        )
+        if native_prefill < total_windows:
+            # Legal but worth observing: almost only native KV allocation
+            # failure - a more reliable "KV is running out" signal than
+            # watching free block counts. The remainder is retried next
+            # step (the window recomputes from num_computed).
+            lwd_logger.warning(
+                "[Lwd][cloud-sched] native under-scheduled: "
+                "native prefill=%d < windows=%d (native-side truncation, "
+                "typically KV pressure)",
+                native_prefill,
+                total_windows,
+            )
         return out
 
     def update_from_output(self, scheduler_output, model_runner_output):
