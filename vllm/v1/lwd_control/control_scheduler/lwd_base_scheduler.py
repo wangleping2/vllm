@@ -132,6 +132,7 @@ class LwdBaseScheduler(AsyncScheduler):
         saved_threshold = sched_cfg.long_prefill_token_threshold
         if chunk_threshold is not None:
             sched_cfg.long_prefill_token_threshold = chunk_threshold
+        out = None
         try:
             out = super().schedule()
         finally:
@@ -141,6 +142,29 @@ class LwdBaseScheduler(AsyncScheduler):
             post = (self.running, self.waiting, self.skipped_waiting)
             self.running, self.waiting, self.skipped_waiting = saved
             self.running += post[0]
-            self.waiting.extend(post[1])
+            preempted_ids = (
+                set(out.preempted_req_ids)
+                if out is not None and getattr(out, "preempted_req_ids", None)
+                else set()
+            )
+            if preempted_ids and post[1]:
+                # Native preempts one at a time, each prepend pushing the
+                # earlier victims further forward - so the post-schedule
+                # waiting order lists later-preempted requests FIRST.
+                # Re-prepend in reverse to restore the original preemption
+                # order at the HEAD of the saved queue (FCFS fairness:
+                # a preempted request must not queue behind requests the
+                # edge admitted later).
+                preempted = [
+                    r for r in post[1] if r.request_id in preempted_ids
+                ]
+                rest = [
+                    r for r in post[1] if r.request_id not in preempted_ids
+                ]
+                self.waiting.extend(rest)
+                for req in reversed(preempted):
+                    self.waiting.prepend_request(req)
+            else:
+                self.waiting.extend(post[1])
             self.skipped_waiting.prepend_requests(post[2])
         return out
