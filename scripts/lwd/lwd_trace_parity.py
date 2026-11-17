@@ -27,10 +27,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+import regex as re
 
 TOP = 20
 _PAIR_RE = re.compile(r"\(\s*(\d+)\s*,\s*(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\s*\)")
