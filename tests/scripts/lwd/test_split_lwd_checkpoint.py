@@ -137,6 +137,31 @@ NATIVE_OWNERSHIP: dict[str, frozenset[str]] = {
     "hc_head_scale": BOTH,
 }
 
+# Kimi-K3 layout: VL nesting without the leading ``model.`` on the text
+# tower, no ``visual`` prefix for the vision components, and the final norm's
+# attention-residual tail as separate submodules. The four rows added for K3
+# must classify every family below, i.e. the split may not leave any tensor
+# uncovered (before the rows existed it aborted with RuleCoverageError).
+K3_OWNERSHIP: dict[str, frozenset[str]] = {
+    # vision side: edge-owned, and no ``model.`` prefix on the checkpoint path
+    "vision_tower.encoder.blocks.0.attn.qkv.weight": EDGE_ONLY,
+    # tower-internal norm must survive the model.norm rule
+    "vision_tower.encoder.blocks.0.norm1.weight": EDGE_ONLY,
+    "mm_projector.linear_1.weight": EDGE_ONLY,
+    "mm_projector.proj.2.weight": EDGE_ONLY,
+    # text side: the language model nests as language_model.model.*
+    "language_model.model.embed_tokens.weight": BOTH,
+    "language_model.lm_head.weight": BOTH,
+    "language_model.model.layers.0.self_attn.q_proj.weight": CLOUD_ONLY,
+    "language_model.model.norm.weight": CLOUD_ONLY,
+    "language_model.model.output_attn_res_norm.weight": CLOUD_ONLY,
+    "language_model.model.output_attn_res_proj.weight": CLOUD_ONLY,
+}
+
+K3_SHARD_TENSORS: dict[str, list[str]] = {
+    "model-00001-of-00001.safetensors": list(K3_OWNERSHIP),
+}
+
 EDGE_METADATA_FILES = {
     "config.json",
     "tokenizer_config.json",
@@ -302,6 +327,45 @@ def test_classify_covers_native_deepseek_layout(role: str) -> None:
     assert uncovered == []
     assert keep == expected_keep
     assert drop == set(weight_map) - expected_keep
+
+
+@pytest.mark.parametrize("role", ["edge", "cloud"])
+def test_classify_covers_kimi_k3_layout(role: str) -> None:
+    """Every Kimi-K3 tensor family is owned; none falls into the fail-fast bucket."""
+    table, _ = script.load_module_ownership()
+    weight_map = {name: "x.safetensors" for name in K3_OWNERSHIP}
+    keep, drop, uncovered, _ = script.classify_all(weight_map, role, table)
+    expected_keep = {n for n, owners in K3_OWNERSHIP.items() if role in owners}
+    assert uncovered == []
+    assert keep == expected_keep
+    assert drop == set(weight_map) - expected_keep
+    assert not keep & drop
+
+
+def test_kimi_k3_layout_is_uncovered_without_the_new_rows() -> None:
+    """Pins the failure mode the four K3 rows fix.
+
+    Dropping any of them puts the matching tensors back into the uncovered
+    bucket, which makes the split abort with RuleCoverageError (exit 3) --
+    i.e. the K3 checkpoint could not be split at all.
+    """
+    table, _ = script.load_module_ownership()
+    k3_rows = {
+        "vision_tower",
+        "mm_projector",
+        "output_attn_res_norm",
+        "output_attn_res_proj",
+    }
+    assert k3_rows <= table.keys()
+    legacy = {k: v for k, v in table.items() if k not in k3_rows}
+    weight_map = {name: "x.safetensors" for name in K3_OWNERSHIP}
+    _, _, uncovered, _ = script.classify_all(weight_map, "edge", legacy)
+    assert {
+        "vision_tower.encoder.blocks.0.attn.qkv.weight",
+        "mm_projector.linear_1.weight",
+        "language_model.model.output_attn_res_norm.weight",
+        "language_model.model.output_attn_res_proj.weight",
+    } <= set(uncovered)
 
 
 @pytest.mark.parametrize("role", ["edge", "cloud"])
@@ -552,6 +616,32 @@ def test_end_to_end_cloud_split(tmp_path: Path) -> None:
     entries = {entry.name for entry in dst.iterdir()}
     shards = {path.name for path in _output_shards(dst)}
     assert entries == shards | CLOUD_METADATA_FILES | {"optional"}
+
+
+def _write_k3_checkpoint(src: Path) -> None:
+    _write_checkpoint(src, shards=K3_SHARD_TENSORS)
+
+
+@pytest.mark.parametrize("role", ["edge", "cloud"])
+def test_kimi_k3_split_end_to_end(tmp_path: Path, role: str) -> None:
+    """A K3-shaped checkpoint splits cleanly and keeps the right tensors.
+
+    Regression for the LWD split: before the K3 rows existed this aborted with
+    RuleCoverageError (uncovered vision_tower / mm_projector / attn-res tails).
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+    _write_k3_checkpoint(src)
+    _write_standard_metadata(src)
+    dst = tmp_path / role
+
+    assert _split(src, dst, role) == 0
+
+    tensors, metadatas = _output_tensors(dst)
+    expected = {n for n, owners in K3_OWNERSHIP.items() if role in owners}
+    assert set(tensors) == expected
+    assert tensors == {name: _payload(name) for name in expected}
+    assert metadatas and all(m == {"format": "pt"} for m in metadatas.values())
 
 
 def test_split_is_deterministic(tmp_path: Path) -> None:
