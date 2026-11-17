@@ -25,7 +25,9 @@ class TestParseSkipKeys:
         )
 
     def test_cloud_skips_edge_owned_modules(self):
-        assert parse_skip_keys("cloud") == frozenset({"visual"})
+        assert parse_skip_keys("cloud") == frozenset(
+            {"visual", "vision_tower", "mm_projector"}
+        )
 
 
 class TestLwdShouldSkipWeightEdge:
@@ -48,6 +50,12 @@ class TestLwdShouldSkipWeightEdge:
             # native DeepSeek layout without the leading "model"
             "layers.3.mlp.w1.weight",
             "norm.weight",
+            # Kimi-K3 layout: no leading "model." on the VL nesting
+            "language_model.model.layers.0.self_attn.q_proj.weight",
+            "language_model.model.norm.weight",
+            # K3's attention-residual tail is cloud-owned
+            "language_model.model.output_attn_res_norm.weight",
+            "language_model.model.output_attn_res_proj.weight",
         ],
     )
     def test_skips(self, name):
@@ -67,6 +75,11 @@ class TestLwdShouldSkipWeightEdge:
             # dot boundaries: not fooled by longer leaf names
             "model.norm_eps.weight",
             "visualizer.weight",
+            # Kimi-K3 tower/projector belong to the edge
+            "vision_tower.encoder.blocks.0.attn.qkv.weight",
+            "vision_tower.encoder.blocks.0.norm1.weight",
+            "mm_projector.linear_1.weight",
+            "mm_projector.proj.2.weight",
         ],
     )
     def test_keeps(self, name):
@@ -85,6 +98,9 @@ class TestLwdShouldSkipWeightCloud:
             # nested Qwen multimodal tower names
             "model.visual.blocks.0.attn.qkv.weight",
             "model.visual.merger.deepstack_merger_list.0.fc.weight",
+            # Kimi-K3 names the tower/projector without the "visual" prefix
+            "vision_tower.encoder.blocks.0.attn.qkv.weight",
+            "mm_projector.linear_1.weight",
         ],
     )
     def test_skips(self, name):
@@ -100,6 +116,9 @@ class TestLwdShouldSkipWeightCloud:
             "model.language_model.embed_tokens.weight",
             "model.embed_tokens.weight",
             "lm_head.weight",
+            # Kimi-K3's final-norm tail is cloud-owned
+            "language_model.model.output_attn_res_norm.weight",
+            "language_model.model.output_attn_res_proj.weight",
         ],
     )
     def test_keeps(self, name):

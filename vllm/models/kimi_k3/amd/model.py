@@ -29,8 +29,11 @@ from vllm.model_executor.models.kimi_k25_vit import (
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
+    lwd_role,
+    lwd_skips_module,
     maybe_prefix,
 )
 from vllm.model_executor.models.vision import is_vit_use_data_parallel
@@ -99,28 +102,39 @@ class KimiK3ForConditionalGeneration(
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
+        # LWD: the edge owns the vision tower and the projector; the cloud
+        # keeps placeholders because its weight split ships none of those
+        # tensors. The build-time guard decides memory, the ownership-table
+        # row decides load-time filtering -- the two must stay in step.
+        role = lwd_role()
         with self._mark_tower_model(vllm_config, "image"):
-            self.vision_tower = MoonViT3dPretrainedModel(
-                config.vision_config,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "vision_tower"),
-            )
-            if self._maybe_ignore_quant_config(quant_config) is not None:
-                self.vision_tower = self.vision_tower.to(device=self.device)
+            if lwd_skips_module("vision_tower", role):
+                self.vision_tower = PPMissingLayer()
             else:
-                self.vision_tower = self.vision_tower.to(
+                self.vision_tower = MoonViT3dPretrainedModel(
+                    config.vision_config,
+                    quant_config=self._maybe_ignore_quant_config(quant_config),
+                    prefix=maybe_prefix(prefix, "vision_tower"),
+                )
+                if self._maybe_ignore_quant_config(quant_config) is not None:
+                    self.vision_tower = self.vision_tower.to(device=self.device)
+                else:
+                    self.vision_tower = self.vision_tower.to(
+                        device=self.device, dtype=model_config.dtype
+                    )
+
+            if lwd_skips_module("mm_projector", role):
+                self.mm_projector = PPMissingLayer()
+            else:
+                self.mm_projector = KimiK25MultiModalProjector(
+                    config=config.vision_config,
+                    use_data_parallel=self.use_data_parallel,
+                    quant_config=self._maybe_ignore_quant_config(quant_config),
+                    prefix=maybe_prefix(prefix, "mm_projector"),
+                )
+                self.mm_projector = self.mm_projector.to(
                     device=self.device, dtype=model_config.dtype
                 )
-
-            self.mm_projector = KimiK25MultiModalProjector(
-                config=config.vision_config,
-                use_data_parallel=self.use_data_parallel,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "mm_projector"),
-            )
-            self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=model_config.dtype
-            )
 
         self.quant_config = quant_config
         with self._mark_language_model(vllm_config):
@@ -217,6 +231,21 @@ class KimiK3ForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
+
+    def finalize_down_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize hidden states before they are sent DOWN (LWD cloud only).
+
+        K3 keeps the final norm inside ``compute_logits`` so the MTP draft
+        receives pre-norm hidden states; the edge replay feeds the DOWN payload
+        straight into ``compute_logits``, so the norm has to happen here.
+
+        Args:
+            hidden_states: Pre-norm hidden states of the sampled rows.
+
+        Returns:
+            The same rows normalized by the model's final RMSNorm.
+        """
+        return self.language_model.model.norm(hidden_states, None)
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.language_model.mamba_cache.copy_inputs_before_cuda_graphs(

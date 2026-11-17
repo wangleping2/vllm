@@ -58,6 +58,8 @@ from vllm.model_executor.models.utils import (
     PPMissingLayer,
     get_spec_layer_idx_from_weight_name,
     is_pp_missing_parameter,
+    lwd_role,
+    lwd_skips_module,
     make_layers,
     maybe_prefix,
 )
@@ -694,9 +696,21 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
 
-        if get_pp_group().is_last_rank:
+        # LWD: the cloud owns the final norm (it normalizes before hidden
+        # states go DOWN); the edge gets a placeholder so the compute_logits
+        # call site stays untouched and becomes an identity there.
+        role = lwd_role()
+        if get_pp_group().is_last_rank and not lwd_skips_module("model.norm", role):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if config.attn_res_block_size is not None:
+        else:
+            self.norm = PPMissingLayer()
+
+        # The attention-residual tail of the final norm only runs in the cloud
+        # forward; the edge keeps placeholders (attributes stay present).
+        if config.attn_res_block_size is not None:
+            if get_pp_group().is_last_rank and not lwd_skips_module(
+                "output_attn_res_norm", role
+            ):
                 self.output_attn_res_norm = RMSNorm(
                     config.hidden_size, eps=config.rms_norm_eps
                 )
@@ -707,9 +721,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
                     quant_config=None,
                     prefix=f"{prefix}.output_attn_res_proj",
                 )
-        else:
-            self.norm = PPMissingLayer()
-            if config.attn_res_block_size is not None:
+            else:
                 self.output_attn_res_norm = PPMissingLayer()
                 self.output_attn_res_proj = PPMissingLayer()
 
@@ -1081,6 +1093,21 @@ class KimiLinearForCausalLM(
         # that the pre-norm hidden states can be fed to the MTP draft model.
         hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
+
+    def finalize_down_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize hidden states before they are sent DOWN (LWD cloud only).
+
+        ``compute_logits`` owns the norm so the MTP draft keeps seeing pre-norm
+        hidden states; the edge replay feeds the DOWN payload straight into
+        ``compute_logits``, so the norm has to happen here.
+
+        Args:
+            hidden_states: Pre-norm hidden states of the sampled rows.
+
+        Returns:
+            The same rows normalized by the model's final RMSNorm.
+        """
+        return self.model.norm(hidden_states, None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)

@@ -9,6 +9,8 @@ cloud norm hidden states before sending them DOWN), the cloud skips the
 vision tower (multimodal processing lives on the edge).
 """
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -88,8 +90,19 @@ def _param_names(model: torch.nn.Module) -> set[str]:
         ("language_model.visual", "cloud", True),
         ("visual.merger.proj", "cloud", False),
         ("visual", "edge", False),
-        # Other towers are not covered by the rule.
-        ("vision_tower", "cloud", False),
+        # Kimi-K3/K2.5 name the tower and projector without the "visual"
+        # prefix; the dedicated rows cover the flat and the prefixed layouts.
+        ("vision_tower", "cloud", True),
+        ("vision_tower", "edge", False),
+        ("model.vision_tower", "cloud", True),
+        ("mm_projector", "cloud", True),
+        ("language_model.model.mm_projector", "cloud", True),
+        ("mm_projector", "edge", False),
+        # Kimi-K3's final-norm attention-residual tail belongs to the cloud.
+        ("output_attn_res_norm", "edge", True),
+        ("output_attn_res_norm", "cloud", False),
+        ("language_model.model.output_attn_res_proj", "edge", True),
+        ("language_model.model.output_attn_res_proj", "cloud", False),
         # Both-role modules.
         ("model.embed_tokens", "edge", False),
         ("model.embed_tokens", "cloud", False),
@@ -111,7 +124,15 @@ def test_lwd_skips_module_ownership(
 
 def test_lwd_skips_module_none_role_keeps_pre_lwd_behavior() -> None:
     """Non-LWD processes (role=None) must never skip any module."""
-    for module_path in ("model.norm", "visual", "model.layers", "model.mtp"):
+    for module_path in (
+        "model.norm",
+        "visual",
+        "vision_tower",
+        "mm_projector",
+        "output_attn_res_norm",
+        "model.layers",
+        "model.mtp",
+    ):
         assert lwd_skips_module(module_path, None) is False
 
 
@@ -427,3 +448,119 @@ def test_qwen3_vl_visual_guard(
         assert isinstance(model.visual, _DummyVisionTower)
         assert visual_params
         assert model.use_deepstack is True
+
+
+def test_kimi_k3_exposes_down_norm_hook() -> None:
+    """Both K3 entry architectures implement the optional DOWN-norm hook.
+
+    The LWD cloud runner looks the hook up by name and falls back to identity,
+    so a missing implementation would silently ship pre-norm hidden states
+    DOWN while the edge skips its norm -> un-normalized logits.
+    """
+    from vllm.models.kimi_k3.nvidia.model import (
+        KimiK3ForConditionalGeneration,
+        KimiLinearForCausalLM,
+    )
+
+    for cls in (KimiK3ForConditionalGeneration, KimiLinearForCausalLM):
+        assert callable(getattr(cls, "finalize_down_hidden", None)), cls.__name__
+
+
+def test_kimi_k3_down_norm_hook_applies_final_norm() -> None:
+    """The hook must apply the model's final norm (not a copy of it)."""
+    from vllm.models.kimi_k3.nvidia.model import KimiLinearForCausalLM
+
+    calls: list[tuple[torch.Tensor, object]] = []
+
+    def _norm(hidden: torch.Tensor, residual: object) -> torch.Tensor:
+        calls.append((hidden, residual))
+        return hidden * 2.0
+
+    fake_self = SimpleNamespace(model=SimpleNamespace(norm=_norm))
+    hidden = torch.ones(1)
+    out = KimiLinearForCausalLM.finalize_down_hidden(fake_self, hidden)
+    assert out.item() == 2.0
+    assert calls and calls[0][0] is hidden and calls[0][1] is None
+
+
+# ---------------------------------------------------------------------------
+# Kimi-K3 construction-guard wiring (source scan).
+#
+# Building the real K3 model needs the full multimodal stack, so the wiring
+# contract is locked with an AST scan instead (the same approach as
+# vllm-ascend's tests/ut/models/test_lwd_kimi_k3_guard.py): every guard label
+# must be a literal that exists as an ``LWD_MODULE_OWNERSHIP`` row, and each
+# implementation must guard exactly the modules it owns.
+# ---------------------------------------------------------------------------
+
+_K3_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: Guard labels each vllm implementation must pass to ``lwd_skips_module``.
+#: ``output_attn_res_proj`` shares the norm's guard branch (one call, two
+#: assignments), so it has no call site of its own.
+_K3_GUARD_LABELS_BY_FILE: dict[str, frozenset[str]] = {
+    "vllm/models/kimi_k3/nvidia/model.py": frozenset(
+        {"model.norm", "output_attn_res_norm", "vision_tower", "mm_projector"}
+    ),
+    "vllm/models/kimi_k3/amd/linear.py": frozenset(
+        {"model.norm", "output_attn_res_norm"}
+    ),
+    "vllm/models/kimi_k3/amd/model.py": frozenset({"vision_tower", "mm_projector"}),
+}
+
+#: ``finalize_down_hidden`` definition sites: the VL and text-only
+#: architectures, in both the nvidia and amd implementations. The ascend
+#: classes inherit the amd pair, so a missing amd definition would silently
+#: disable the hook on NPU (the only platform LWD targets).
+_K3_HOOK_SITES_BY_FILE: dict[str, frozenset[str]] = {
+    "vllm/models/kimi_k3/nvidia/model.py": frozenset(
+        {"KimiK3ForConditionalGeneration", "KimiLinearForCausalLM"}
+    ),
+    "vllm/models/kimi_k3/amd/linear.py": frozenset({"KimiLinearForCausalLM"}),
+    "vllm/models/kimi_k3/amd/model.py": frozenset({"KimiK3ForConditionalGeneration"}),
+}
+
+
+def _parse_k3_source(rel_path: str) -> ast.Module:
+    return ast.parse((_K3_REPO_ROOT / rel_path).read_text(encoding="utf-8"))
+
+
+def _k3_lwd_guard_labels(rel_path: str) -> set[str]:
+    """Literal ``lwd_skips_module`` labels used in one K3 source file."""
+    labels: set[str] = set()
+    for node in ast.walk(_parse_k3_source(rel_path)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "lwd_skips_module":
+            assert node.args, f"{rel_path}: lwd_skips_module() needs a module path"
+            first = node.args[0]
+            assert isinstance(first, ast.Constant) and isinstance(first.value, str), (
+                f"{rel_path}: LWD guards must pass a literal ownership label, "
+                f"got {ast.dump(first)[:60]}"
+            )
+            labels.add(first.value)
+    return labels
+
+
+@pytest.mark.parametrize("rel_path", sorted(_K3_GUARD_LABELS_BY_FILE))
+def test_kimi_k3_guards_match_ownership_table(rel_path: str) -> None:
+    """Each K3 implementation guards exactly the modules the table owns."""
+    labels = _k3_lwd_guard_labels(rel_path)
+    assert labels == _K3_GUARD_LABELS_BY_FILE[rel_path], rel_path
+    unknown = labels - LWD_MODULE_OWNERSHIP.keys()
+    assert not unknown, f"{rel_path}: labels missing from LWD_MODULE_OWNERSHIP"
+
+
+@pytest.mark.parametrize("rel_path", sorted(_K3_HOOK_SITES_BY_FILE))
+def test_kimi_k3_down_norm_hook_sites(rel_path: str) -> None:
+    """The DOWN-norm hook is defined on both architectures, both vendors."""
+    owners: set[str] = set()
+    for node in ast.walk(_parse_k3_source(rel_path)):
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef) and child.name == (
+                    "finalize_down_hidden"
+                ):
+                    owners.add(node.name)
+    assert owners == _K3_HOOK_SITES_BY_FILE[rel_path], rel_path

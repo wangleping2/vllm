@@ -26,6 +26,11 @@ Rules (mirror discipline, ``docs/design/lwd_weight_split.md``):
 * Native DeepSeek layout aliases (``layers.`` / ``embed.`` / ``head.`` /
   ``norm.`` / ``mtp.`` without the leading ``model.``) are explicitly
   registered per ownership row.
+* Kimi-K3/K2.5 layouts name the vision tower and projector
+  ``vision_tower.*`` / ``mm_projector.*`` (no ``model.`` prefix) and keep the
+  final-norm attention-residual tail under
+  ``language_model.model.output_attn_res_{norm,proj}.*``. All four families
+  are owned through table rows, so they need no alias entry.
 * ``tid2eid`` (Hash MoE routing tables) is an edge-keep tensor-level
   special case: it lives under the cloud-owned layers subtree, but
   vllm-ascend reads it directly from the shard files by path, so the edge
@@ -172,7 +177,11 @@ _VENDORED_MODULE_OWNERSHIP: dict[str, frozenset[str]] = {
     "lm_head": frozenset({"edge", "cloud"}),
     "model.layers": frozenset({"cloud"}),
     "model.norm": frozenset({"cloud"}),
+    "output_attn_res_norm": frozenset({"cloud"}),
+    "output_attn_res_proj": frozenset({"cloud"}),
     "visual": frozenset({"edge"}),
+    "vision_tower": frozenset({"edge"}),
+    "mm_projector": frozenset({"edge"}),
     "model.mtp": frozenset({"cloud"}),
 }
 
@@ -242,8 +251,10 @@ def _matches_module_suffix(name: str, key: str) -> bool:
 
     Mirrors the load-time filter (``lwd_weight_filter``): matches the module
     subtree of a pruned tree anywhere in the name, e.g. key ``visual`` owns
-    ``model.visual.merger.ln_q.weight`` and key ``model.norm`` owns
-    ``model.language_model.model.norm.weight`` (after VL unwrap).
+    ``model.visual.merger.ln_q.weight``, key ``model.norm`` owns
+    ``model.language_model.model.norm.weight`` (after VL unwrap), and key
+    ``vision_tower`` owns ``vision_tower.encoder.blocks.0.attn.qkv.weight``
+    (Kimi-K3 layout, no unwrap needed).
     """
     parts = name.split(".")
     for i in range(1, len(parts)):

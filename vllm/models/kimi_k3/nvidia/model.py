@@ -83,6 +83,8 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
+    lwd_role,
+    lwd_skips_module,
     make_layers,
     maybe_prefix,
     spec_decode_needs_target_embed,
@@ -1205,9 +1207,21 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
             else 0
         )
 
-        if get_pp_group().is_last_rank:
+        # LWD: the cloud owns the final norm (it normalizes before hidden
+        # states go DOWN); the edge gets a placeholder so the compute_logits
+        # call site stays untouched and becomes an identity there.
+        role = lwd_role()
+        if get_pp_group().is_last_rank and not lwd_skips_module("model.norm", role):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            if self.use_attn_res:
+        else:
+            self.norm = PPMissingLayer()
+
+        # The attention-residual tail of the final norm only runs in the cloud
+        # forward; the edge keeps placeholders (attributes stay present).
+        if self.use_attn_res:
+            if get_pp_group().is_last_rank and not lwd_skips_module(
+                "output_attn_res_norm", role
+            ):
                 self.output_attn_res_norm = RMSNorm(
                     config.hidden_size, eps=config.rms_norm_eps
                 )
@@ -1218,9 +1232,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
                     quant_config=None,
                     prefix=f"{prefix}.output_attn_res_proj",
                 )
-        else:
-            self.norm = PPMissingLayer()
-            if self.use_attn_res:
+            else:
                 self.output_attn_res_norm = PPMissingLayer()
                 self.output_attn_res_proj = PPMissingLayer()
 
@@ -1726,6 +1738,21 @@ class KimiLinearForCausalLM(
         hidden_states = self.model.norm(hidden_states, None)
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def finalize_down_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize hidden states before they are sent DOWN (LWD cloud only).
+
+        ``compute_logits`` owns the norm so the MTP draft keeps seeing pre-norm
+        hidden states; the edge replay feeds the DOWN payload straight into
+        ``compute_logits``, so the norm has to happen here.
+
+        Args:
+            hidden_states: Pre-norm hidden states of the sampled rows.
+
+        Returns:
+            The same rows normalized by the model's final RMSNorm.
+        """
+        return self.model.norm(hidden_states, None)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
@@ -1810,58 +1837,70 @@ class KimiK3ForConditionalGeneration(
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
 
+        # LWD: the edge owns the vision tower and the projector; the cloud
+        # keeps placeholders because its weight split ships none of those
+        # tensors. The build-time guard decides memory, the ownership-table
+        # row decides load-time filtering -- the two must stay in step.
+        role = lwd_role()
         with self._mark_tower_model(vllm_config, "image"):
-            self.vision_tower = MoonViT3dPretrainedModel(
-                config.vision_config,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "vision_tower"),
-            )
-            if is_meta_module(self.vision_tower):
-                pass
-            elif self._maybe_ignore_quant_config(quant_config) is not None:
-                self.vision_tower = self.vision_tower.to(device=self.device)
+            if lwd_skips_module("vision_tower", role):
+                self.vision_tower = PPMissingLayer()
             else:
-                self.vision_tower = self.vision_tower.to(
-                    device=self.device, dtype=model_config.dtype
+                self.vision_tower = MoonViT3dPretrainedModel(
+                    config.vision_config,
+                    quant_config=self._maybe_ignore_quant_config(quant_config),
+                    prefix=maybe_prefix(prefix, "vision_tower"),
                 )
-
-            vision_attn = self.vision_tower.encoder.blocks[0].attn
-            if vision_attn.is_flash_attn_backend and vision_attn._fa_version == 4:
-                from vllm.models.kimi_k3.nvidia.ops.vision_fa4_warmup import (
-                    KimiK3VisionFA4WarmupConfig,
-                    register_kimi_k3_vision_fa4_warmup,
-                )
-
-                merge_height, merge_width = config.vision_config.merge_kernel_size
-                mm_config = model_config.get_multimodal_config()
-                assert mm_config is not None
-                register_kimi_k3_vision_fa4_warmup(
-                    KimiK3VisionFA4WarmupConfig(
-                        num_heads=vision_attn.num_heads,
-                        head_dim=vision_attn.head_size,
-                        dtype=vision_attn.dtype,
-                        max_batch_size=(
-                            vllm_config.scheduler_config.max_num_seqs
-                            * mm_config.get_limit_per_prompt("image")
-                        ),
-                        max_seqlen=(
-                            vllm_config.scheduler_config.max_num_encoder_input_tokens
-                            * merge_height
-                            * merge_width
-                        ),
+                if is_meta_module(self.vision_tower):
+                    pass
+                elif self._maybe_ignore_quant_config(quant_config) is not None:
+                    self.vision_tower = self.vision_tower.to(device=self.device)
+                else:
+                    self.vision_tower = self.vision_tower.to(
+                        device=self.device, dtype=model_config.dtype
                     )
-                )
 
-            self.mm_projector = KimiK25MultiModalProjector(
-                config=config.vision_config,
-                use_data_parallel=self.use_data_parallel,
-                quant_config=self._maybe_ignore_quant_config(quant_config),
-                prefix=maybe_prefix(prefix, "mm_projector"),
-            )
-            if not is_meta_module(self.mm_projector):
-                self.mm_projector = self.mm_projector.to(
-                    device=self.device, dtype=model_config.dtype
+                vision_attn = self.vision_tower.encoder.blocks[0].attn
+                if vision_attn.is_flash_attn_backend and vision_attn._fa_version == 4:
+                    from vllm.models.kimi_k3.nvidia.ops.vision_fa4_warmup import (
+                        KimiK3VisionFA4WarmupConfig,
+                        register_kimi_k3_vision_fa4_warmup,
+                    )
+
+                    merge_height, merge_width = config.vision_config.merge_kernel_size
+                    mm_config = model_config.get_multimodal_config()
+                    assert mm_config is not None
+                    max_encoder_tokens = (
+                        vllm_config.scheduler_config.max_num_encoder_input_tokens
+                    )
+                    register_kimi_k3_vision_fa4_warmup(
+                        KimiK3VisionFA4WarmupConfig(
+                            num_heads=vision_attn.num_heads,
+                            head_dim=vision_attn.head_size,
+                            dtype=vision_attn.dtype,
+                            max_batch_size=(
+                                vllm_config.scheduler_config.max_num_seqs
+                                * mm_config.get_limit_per_prompt("image")
+                            ),
+                            max_seqlen=(
+                                max_encoder_tokens * merge_height * merge_width
+                            ),
+                        )
+                    )
+
+            if lwd_skips_module("mm_projector", role):
+                self.mm_projector = PPMissingLayer()
+            else:
+                self.mm_projector = KimiK25MultiModalProjector(
+                    config=config.vision_config,
+                    use_data_parallel=self.use_data_parallel,
+                    quant_config=self._maybe_ignore_quant_config(quant_config),
+                    prefix=maybe_prefix(prefix, "mm_projector"),
                 )
+                if not is_meta_module(self.mm_projector):
+                    self.mm_projector = self.mm_projector.to(
+                        device=self.device, dtype=model_config.dtype
+                    )
 
         self.quant_config = quant_config
         with self._mark_language_model(vllm_config):
@@ -2155,6 +2194,21 @@ class KimiK3ForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         return self.language_model.compute_logits(hidden_states)
+
+    def finalize_down_hidden(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Normalize hidden states before they are sent DOWN (LWD cloud only).
+
+        K3 keeps the final norm inside ``compute_logits`` so the MTP draft
+        receives pre-norm hidden states; the edge replay feeds the DOWN payload
+        straight into ``compute_logits``, so the norm has to happen here.
+
+        Args:
+            hidden_states: Pre-norm hidden states of the sampled rows.
+
+        Returns:
+            The same rows normalized by the model's final RMSNorm.
+        """
+        return self.language_model.model.norm(hidden_states, None)
 
     def copy_inputs_before_cuda_graphs(self, input_buffers, **kwargs):
         return self.language_model.mamba_cache.copy_inputs_before_cuda_graphs(

@@ -870,7 +870,16 @@ LWD_MODULE_OWNERSHIP: dict[str, frozenset[LwdRole]] = {
     # Cloud applies the final norm before sending hidden states DOWN; the
     # edge feeds them straight into compute_logits (no norm there).
     "model.norm": frozenset(("cloud",)),
+    # Kimi-K3 factors the final norm's attention-residual tail into separate
+    # modules, used only by the cloud forward (residual replay lives there).
+    "output_attn_res_norm": frozenset(("cloud",)),
+    "output_attn_res_proj": frozenset(("cloud",)),
     "visual": frozenset(("edge",)),
+    # Kimi models name the tower and projector without the "visual" prefix
+    # ("vision_tower"/"mm_projector"); the dot-boundary suffix match covers
+    # both the flat and the "model."-prefixed checkpoint layouts.
+    "vision_tower": frozenset(("edge",)),
+    "mm_projector": frozenset(("edge",)),
     "model.mtp": frozenset(("cloud",)),
 }
 
